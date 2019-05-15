@@ -46,17 +46,19 @@ var (
 )
 
 var (
-	cache          ybc.Cacher
-	stats          Stats
-	upstreamClient *fasthttp.HostClient
+	cache             ybc.Cacher
+	stats             Stats
+	upstreamClient    *fasthttp.HostClient
+	logger            *log.Logger
+	upstreamHostBytes []byte
 )
 
 func main() {
 	iniflags.Parse()
-	logger := log.New(os.Stdout, "[proxy-cache] ", log.LstdFlags|log.Lshortfile)
+	logger = log.New(os.Stdout, "[proxy-cache] ", log.LstdFlags|log.Lshortfile)
 	upstreamHostBytes = []byte(*upstreamHost)
 
-	cache = createCache(logger)
+	cache = createCache()
 	defer cache.Close()
 
 	upstreamClient = &fasthttp.HostClient{
@@ -64,8 +66,8 @@ func main() {
 		MaxConns: *maxIdleUpstreamConns,
 	}
 
-	httpsSrv, httpsLn := serveHttps(*httpsListenAddr, logger)
-	httpSrv, httpLn := serveHttp(*listenAddr, logger)
+	httpsSrv, httpsLn := serveHttps(*httpsListenAddr)
+	httpSrv, httpLn := serveHttp(*listenAddr)
 
 	go func() {
 		if httpsSrv == nil {
@@ -111,7 +113,7 @@ func main() {
 	}
 }
 
-func createCache(logger *log.Logger) ybc.Cacher {
+func createCache() ybc.Cacher {
 	config := ybc.Config{
 		MaxItemsCount: ybc.SizeT(*maxItemsCount),
 		DataFileSize:  ybc.SizeT(*cacheSize) * ybc.SizeT(1024*1024),
@@ -152,7 +154,7 @@ func createCache(logger *log.Logger) ybc.Cacher {
 	return cache
 }
 
-func serveHttps(addr string, logger *log.Logger) (*fasthttp.Server, net.Listener) {
+func serveHttps(addr string) (*fasthttp.Server, net.Listener) {
 	if addr == "" {
 		return nil, nil
 	}
@@ -168,7 +170,7 @@ func serveHttps(addr string, logger *log.Logger) (*fasthttp.Server, net.Listener
 	return serve(ln), ln
 }
 
-func serveHttp(addr string, logger *log.Logger) (*fasthttp.Server, net.Listener) {
+func serveHttp(addr string) (*fasthttp.Server, net.Listener) {
 	if addr == "" {
 		return nil, nil
 	}
@@ -180,7 +182,7 @@ func serveHttp(addr string, logger *log.Logger) (*fasthttp.Server, net.Listener)
 func listen(addr string) net.Listener {
 	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
-		logFatal("Cannot listen [%s]: [%s]", addr, err)
+		logger.Fatalf("Cannot listen [%s]: [%s]", addr, err)
 	}
 	return ln
 }
@@ -188,7 +190,7 @@ func listen(addr string) net.Listener {
 func serve(ln net.Listener) *fasthttp.Server {
 	s := &fasthttp.Server{
 		Handler:      requestHandler,
-		Name:         "go-cdn-booster",
+		Name:         "proxy-cache",
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
 	}
@@ -260,7 +262,7 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	item, err := cache.GetDeItem(key, time.Second)
 	if err != nil {
 		if err != ybc.ErrCacheMiss {
-			logFatal("Unexpected error when obtaining cache value by key=[%s]: [%s]", key, err)
+			logger.Fatalf("Unexpected error when obtaining cache value by key=[%s]: [%s]", key, err)
 		}
 
 		atomic.AddInt64(&stats.CacheMissesCount, 1)
@@ -385,8 +387,6 @@ func loadContentType(h *fasthttp.RequestHeader, r io.Reader) (contentType string
 	return
 }
 
-var upstreamHostBytes []byte
-
 func getRequestHost(h *fasthttp.RequestHeader) []byte {
 	if *useClientRequestHost {
 		return h.Host()
@@ -396,17 +396,7 @@ func getRequestHost(h *fasthttp.RequestHeader) []byte {
 
 func logRequestError(h *fasthttp.RequestHeader, format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	logMessage("%s - %s - %s. %s", h.RequestURI(), h.Referer(), h.UserAgent(), msg)
-}
-
-func logMessage(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	log.Printf("%s\n", msg)
-}
-
-func logFatal(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	log.Fatalf("%s\n", msg)
+	logger.Printf("%s - %s - %s. %s", h.RequestURI(), h.Referer(), h.UserAgent(), msg)
 }
 
 type Stats struct {

@@ -1,23 +1,7 @@
 // CDN booster
 //
 // This is a dumb HTTP proxy, which caches files obtained from upstreamHost.
-//
-// Currently go-cdn-booster has the following limitations:
-//   * Supports only GET requests.
-//   * Doesn't respect HTTP headers received from both the client and
-//     the upstream host.
-//   * Optimized for small static files aka images, js and css with sizes
-//     not exceeding few Mb each.
-//   * It caches all files without expiration time.
-//     Actually this is a feature :)
-//
-// Thanks to YBC it has the following features:
-//   * Should be extremely fast.
-//   * Cached items survive CDN booster restart if backed by cacheFilesPath.
-//   * Cache size isn't limited by RAM size.
-//   * Optimized for SSDs and HDDs.
-//   * Performance shouldn't depend on the number of cached items.
-//   * It is deadly simple in configuration and maintenance.
+// Derived from https://github.com/valyala/ybc/tree/master/apps/go/cdn-booster
 //
 package main
 
@@ -29,9 +13,12 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/valyala/fasthttp"
@@ -48,8 +35,8 @@ var (
 	cacheSize            = flag.Int("cacheSize", 100, "The total cache size in Mbytes")
 	httpsCertFile        = flag.String("httpsCertFile", "/etc/ssl/certs/ssl-cert-snakeoil.pem", "Path to HTTPS server certificate. Used only if listenHttpsAddr is set")
 	httpsKeyFile         = flag.String("httpsKeyFile", "/etc/ssl/private/ssl-cert-snakeoil.key", "Path to HTTPS server key. Used only if listenHttpsAddr is set")
-	httpsListenAddrs     = flag.String("httpsListenAddrs", "", "A list of TCP addresses to listen to HTTPS requests. Leave empty if you don't need https")
-	listenAddrs          = flag.String("listenAddrs", ":8098", "A list of TCP addresses to listen to HTTP requests. Leave empty if you don't need http")
+	httpsListenAddr      = flag.String("httpsListenAddr", "", "TCP address to listen to HTTPS requests. Leave empty if you don't need https")
+	listenAddr           = flag.String("listenAddr", ":8098", "TCP address to listen to HTTP requests. Leave empty if you don't need http")
 	maxIdleUpstreamConns = flag.Int("maxIdleUpstreamConns", 50, "The maximum idle connections to upstream host")
 	maxItemsCount        = flag.Int("maxItemsCount", 100*1000, "The maximum number of items in the cache")
 	statsRequestPath     = flag.String("statsRequestPath", "/static_proxy_stats", "Path to page with statistics")
@@ -66,10 +53,10 @@ var (
 
 func main() {
 	iniflags.Parse()
-
+	logger := log.New(os.Stdout, "[proxy-cache] ", log.LstdFlags|log.Lshortfile)
 	upstreamHostBytes = []byte(*upstreamHost)
 
-	cache = createCache()
+	cache = createCache(logger)
 	defer cache.Close()
 
 	upstreamClient = &fasthttp.HostClient{
@@ -77,19 +64,54 @@ func main() {
 		MaxConns: *maxIdleUpstreamConns,
 	}
 
-	var addr string
-	for _, addr = range strings.Split(*httpsListenAddrs, ",") {
-		go serveHttps(addr)
-	}
-	for _, addr = range strings.Split(*listenAddrs, ",") {
-		go serveHttp(addr)
+	httpsSrv, httpsLn := serveHttps(*httpsListenAddr, logger)
+	httpSrv, httpLn := serveHttp(*listenAddr, logger)
+
+	go func() {
+		if httpsSrv == nil {
+			return
+		}
+		err := httpsSrv.Serve(httpsLn)
+		if err != nil {
+			logger.Fatal(err)
+		}
+	}()
+
+	go func() {
+		if httpSrv == nil {
+			return
+		}
+		err := httpSrv.Serve(httpLn)
+		if err != nil {
+			logger.Fatal(err)
+		}
+	}()
+
+	// listen for signals
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+
+	// Block until one of the signals above is received
+	<-signalCh
+	logger.Println("Quit signal received, initializing shutdown...")
+	logger.Println("Stopping HTTP server")
+
+	if httpSrv != nil {
+		err := httpSrv.Shutdown()
+		if err != nil {
+			logger.Println(err)
+		}
 	}
 
-	waitForeverCh := make(chan int)
-	<-waitForeverCh
+	if httpsSrv != nil {
+		err := httpsSrv.Shutdown()
+		if err != nil {
+			logger.Println(err)
+		}
+	}
 }
 
-func createCache() ybc.Cacher {
+func createCache(logger *log.Logger) ybc.Cacher {
 	config := ybc.Config{
 		MaxItemsCount: ybc.SizeT(*maxItemsCount),
 		DataFileSize:  ybc.SizeT(*cacheSize) * ybc.SizeT(1024*1024),
@@ -100,15 +122,15 @@ func createCache() ybc.Cacher {
 
 	cacheFilesPath_ := strings.Split(*cacheFilesPath, ",")
 	cacheFilesCount := len(cacheFilesPath_)
-	logMessage("Opening data files. This can take a while for the first time if files are big")
+	logger.Println("Opening data files. This can take a while for the first time if files are big")
 	if cacheFilesCount < 2 {
 		if cacheFilesPath_[0] != "" {
-			config.DataFile = cacheFilesPath_[0] + ".cdn-booster.data"
-			config.IndexFile = cacheFilesPath_[0] + ".cdn-booster.index"
+			config.DataFile = cacheFilesPath_[0] + ".data"
+			config.IndexFile = cacheFilesPath_[0] + ".index"
 		}
 		cache, err = config.OpenCache(true)
 		if err != nil {
-			logFatal("Cannot open cache: [%s]", err)
+			logger.Fatalf("Cannot open cache: [%s]", err)
 		}
 	} else if cacheFilesCount > 1 {
 		config.MaxItemsCount /= ybc.SizeT(cacheFilesCount)
@@ -123,36 +145,36 @@ func createCache() ybc.Cacher {
 		}
 		cache, err = configs.OpenCluster(true)
 		if err != nil {
-			logFatal("Cannot open cache cluster: [%s]", err)
+			logger.Fatalf("Cannot open cache cluster: [%s]", err)
 		}
 	}
-	logMessage("Data files have been opened")
+	logger.Println("Data files have been opened")
 	return cache
 }
 
-func serveHttps(addr string) {
+func serveHttps(addr string, logger *log.Logger) (*fasthttp.Server, net.Listener) {
 	if addr == "" {
-		return
+		return nil, nil
 	}
 	cert, err := tls.LoadX509KeyPair(*httpsCertFile, *httpsKeyFile)
 	if err != nil {
-		logFatal("Cannot load certificate: [%s]", err)
+		logger.Fatalf("Cannot load certificate: [%s]", err)
 	}
 	c := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 	}
 	ln := tls.NewListener(listen(addr), c)
-	logMessage("Listening https on [%s]", addr)
-	serve(ln)
+	logger.Printf("Listening https on [%s]", addr)
+	return serve(ln), ln
 }
 
-func serveHttp(addr string) {
+func serveHttp(addr string, logger *log.Logger) (*fasthttp.Server, net.Listener) {
 	if addr == "" {
-		return
+		return nil, nil
 	}
 	ln := listen(addr)
-	logMessage("Listening http on [%s]", addr)
-	serve(ln)
+	logger.Printf("Listening http on [%s]", addr)
+	return serve(ln), ln
 }
 
 func listen(addr string) net.Listener {
@@ -163,12 +185,14 @@ func listen(addr string) net.Listener {
 	return ln
 }
 
-func serve(ln net.Listener) {
+func serve(ln net.Listener) *fasthttp.Server {
 	s := &fasthttp.Server{
-		Handler: requestHandler,
-		Name:    "go-cdn-booster",
+		Handler:      requestHandler,
+		Name:         "go-cdn-booster",
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 5 * time.Second,
 	}
-	s.Serve(ln)
+	return s
 }
 
 var keyPool sync.Pool
@@ -192,7 +216,6 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 		upstreamUrl := fmt.Sprintf("%s://%s%s", *upstreamProtocol, *upstreamHost, h.RequestURI())
 		var req fasthttp.Request
 		req.SetRequestURI(upstreamUrl)
-		logMessage("uri- %s", upstreamUrl)
 
 		var resp fasthttp.Response
 		err := upstreamClient.Do(&req, &resp)

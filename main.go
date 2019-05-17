@@ -8,10 +8,13 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
+	"github.com/agnivade/mdns"
 	"github.com/vharitonsky/iniflags"
 )
 
@@ -32,6 +35,7 @@ var (
 	upstreamHost         = flag.String("upstreamHost", "www.google.com", "Upstream host to proxy data from. May include port in the form 'host:port'")
 	upstreamProtocol     = flag.String("upstreamProtocol", "http", "Use this protocol when talking to the upstream")
 	useClientRequestHost = flag.Bool("useClientRequestHost", false, "If set to true, then use 'Host' header from client requests in requests to upstream host. Otherwise use upstreamHost as a 'Host' header in upstream requests")
+	iface                = flag.String("iface", "wlp4s0", "interface to publish service info")
 )
 
 func main() {
@@ -40,6 +44,21 @@ func main() {
 
 	cs := NewCacheServer(logger)
 	cs.Start()
+
+	_, port, err := net.SplitHostPort(*listenAddr)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	iPort, err := strconv.Atoi(port)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	mServer, err := mdns.Publish(*iface, iPort, "proxy_cache._tcp", "Proxy cache service")
+	if err != nil {
+		logger.Fatal(err)
+	}
 
 	// listen for signals
 	signalCh := make(chan os.Signal, 1)
@@ -51,4 +70,10 @@ func main() {
 	logger.Println("Stopping HTTP server")
 
 	cs.Close()
+
+	logger.Println("Stopping mDNS service")
+	err = mServer.Shutdown()
+	if err != nil {
+		logger.Println(err)
+	}
 }

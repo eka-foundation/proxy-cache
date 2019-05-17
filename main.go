@@ -35,7 +35,10 @@ var (
 	upstreamHost         = flag.String("upstreamHost", "www.google.com", "Upstream host to proxy data from. May include port in the form 'host:port'")
 	upstreamProtocol     = flag.String("upstreamProtocol", "http", "Use this protocol when talking to the upstream")
 	useClientRequestHost = flag.Bool("useClientRequestHost", false, "If set to true, then use 'Host' header from client requests in requests to upstream host. Otherwise use upstreamHost as a 'Host' header in upstream requests")
-	iface                = flag.String("iface", "wlp4s0", "interface to publish service info")
+
+	// mdns info
+	iface = flag.String("iface", "wlp4s0", "interface to publish service info")
+	fName = flag.String("friendlyName", "Cache1", "A friendly name to identify this service")
 )
 
 func main() {
@@ -55,7 +58,7 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	mServer, err := mdns.Publish(*iface, iPort, "proxy_cache._tcp", "Proxy cache service")
+	mServer, err := mdns.Publish(*iface, iPort, "proxy_cache._tcp", *fName)
 	if err != nil {
 		logger.Fatal(err)
 	}

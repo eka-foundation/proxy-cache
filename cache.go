@@ -21,7 +21,7 @@ import (
 type cacheServer struct {
 	cache             ybc.Cacher
 	stats             Stats
-	upstreamClient    *fasthttp.HostClient
+	upstreamClient    *fasthttp.Client
 	logger            *log.Logger
 	upstreamHostBytes []byte
 	keyPool           sync.Pool
@@ -31,13 +31,9 @@ type cacheServer struct {
 // NewCacheServer returns a new instance of a cache server.
 func NewCacheServer(l *log.Logger) *cacheServer {
 	c := &cacheServer{
-		cache: createCache(l),
-		upstreamClient: &fasthttp.HostClient{
-			Addr:     *upstreamHost,
-			MaxConns: *maxIdleUpstreamConns,
-		},
-		upstreamHostBytes: []byte(*upstreamHost),
-		logger:            l,
+		cache:          createCache(l),
+		upstreamClient: &fasthttp.Client{},
+		logger:         l,
 	}
 	return c
 }
@@ -201,7 +197,7 @@ func (cs *cacheServer) requestHandler(ctx *fasthttp.RequestCtx) {
 		var resp fasthttp.Response
 		err := cs.upstreamClient.Do(&req, &resp)
 		if err != nil {
-			cs.logRequestError(h, "Cannot make request for [%s]: [%s]", ctx.RequestURI(), err)
+			cs.logRequestError(h, "Cannot make request for [%s]: [%s]", upstreamURL, err)
 			return
 		}
 

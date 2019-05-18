@@ -183,7 +183,8 @@ func (cs *cacheServer) requestHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	if string(ctx.RequestURI()) == *statsRequestPath {
+	path := string(ctx.Path())
+	if path == *statsRequestPath {
 		var w bytes.Buffer
 		cs.stats.WriteToStream(&w)
 		ctx.Success("text/plain", w.Bytes())
@@ -191,20 +192,21 @@ func (cs *cacheServer) requestHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	// Avoid caching of m3u8 playlist file
-	if strings.HasSuffix(string(ctx.RequestURI()), ".m3u8") {
-		upstreamUrl := fmt.Sprintf("%s://%s%s", *upstreamProtocol, *upstreamHost, h.RequestURI())
+	if strings.HasSuffix(path, ".m3u8") {
+		originAddr := ctx.QueryArgs().Peek("origin")
+		upstreamURL := *upstreamProtocol + "://" + string(originAddr) + path
 		var req fasthttp.Request
-		req.SetRequestURI(upstreamUrl)
+		req.SetRequestURI(upstreamURL)
 
 		var resp fasthttp.Response
 		err := cs.upstreamClient.Do(&req, &resp)
 		if err != nil {
-			cs.logRequestError(h, "Cannot make request for [%s]: [%s]", h.RequestURI(), err)
+			cs.logRequestError(h, "Cannot make request for [%s]: [%s]", ctx.RequestURI(), err)
 			return
 		}
 
 		if resp.StatusCode() != fasthttp.StatusOK {
-			cs.logRequestError(h, "Unexpected status code=%d for the response [%s]", resp.StatusCode(), h.RequestURI())
+			cs.logRequestError(h, "Unexpected status code=%d for the response [%s]", resp.StatusCode(), ctx.RequestURI())
 			return
 		}
 
@@ -234,8 +236,8 @@ func (cs *cacheServer) requestHandler(ctx *fasthttp.RequestCtx) {
 		v = make([]byte, 128)
 	}
 	key := v.([]byte)
-	key = append(key[:0], cs.getRequestHost(h)...)
-	key = append(key, ctx.RequestURI()...)
+	key = append(key[:0], ctx.QueryArgs().Peek("origin")...)
+	key = append(key, ctx.Path()...)
 	item, err := cs.cache.GetDeItem(key, time.Second)
 	if err != nil {
 		if err != ybc.ErrCacheMiss {
@@ -273,9 +275,9 @@ func (cs *cacheServer) requestHandler(ctx *fasthttp.RequestCtx) {
 }
 
 func (cs *cacheServer) fetchFromUpstream(h *fasthttp.RequestHeader, key []byte) *ybc.Item {
-	upstreamUrl := fmt.Sprintf("%s://%s%s", *upstreamProtocol, *upstreamHost, h.RequestURI())
+	upstreamURL := *upstreamProtocol + "://" + string(key)
 	var req fasthttp.Request
-	req.SetRequestURI(upstreamUrl)
+	req.SetRequestURI(upstreamURL)
 
 	var resp fasthttp.Response
 	err := cs.upstreamClient.Do(&req, &resp)

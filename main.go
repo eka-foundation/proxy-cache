@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/agnivade/mdns"
 	"github.com/vharitonsky/iniflags"
@@ -37,15 +38,21 @@ var (
 	useClientRequestHost = flag.Bool("useClientRequestHost", false, "If set to true, then use 'Host' header from client requests in requests to upstream host. Otherwise use upstreamHost as a 'Host' header in upstream requests")
 
 	// mdns info
-	iface = flag.String("iface", "wlp4s0", "interface to publish service info")
-	fName = flag.String("friendlyName", "Cache1", "A friendly name to identify this service")
+	iface         = flag.String("iface", "wlp4s0", "interface to publish service info")
+	fName         = flag.String("friendlyName", "Cache1", "A friendly name to identify this service")
+	queryInterval = flag.String("queryInterval", "5m", `interval after which to re-query the list of services. Valid time units are "ns", "us" (or "µs"), "ms", "s", "m", "h".`)
 )
 
 func main() {
 	iniflags.Parse()
 	logger := log.New(os.Stdout, "[proxy-cache] ", log.LstdFlags|log.Lshortfile)
 
-	cs := NewCacheServer(logger)
+	duration, err := time.ParseDuration(*queryInterval)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	cs := NewCacheServer(logger, duration)
 	cs.Start()
 
 	_, port, err := net.SplitHostPort(*listenAddr)

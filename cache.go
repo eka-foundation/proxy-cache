@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,7 +30,7 @@ type cacheServer struct {
 	keyPool                 sync.Pool
 	entriesChan             chan *mdns.ServiceEntry
 	queryInterval           time.Duration
-	httpSrv, httpsSrv       *fasthttp.Server
+	httpSrv                 *fasthttp.Server
 	queryDoneChan, quitChan chan struct{}
 }
 
@@ -52,7 +51,6 @@ func NewCacheServer(l *log.Logger, queryInt time.Duration) *cacheServer {
 
 // Start starts the cache server.
 func (cs *cacheServer) Start() {
-	httpsSrv, httpsLn := cs.serveHttps(*httpsListenAddr)
 	var ln net.Listener
 	cs.httpSrv, ln = cs.serveHttp(*listenAddr)
 	go func() {
@@ -65,17 +63,6 @@ func (cs *cacheServer) Start() {
 		}
 		// sending the quit signal.
 		cs.quitChan <- struct{}{}
-	}()
-
-	go func() {
-		if httpsSrv == nil {
-			return
-		}
-		err := httpsSrv.Serve(httpsLn)
-		if err != nil {
-			cs.logger.Fatal(err)
-		}
-		cs.httpsSrv = httpsSrv
 	}()
 
 	go cs.readServiceEntries()
@@ -146,13 +133,6 @@ func (cs *cacheServer) Close() {
 		cs.logger.Println(err)
 	}
 
-	if cs.httpsSrv != nil {
-		err := cs.httpsSrv.Shutdown()
-		if err != nil {
-			cs.logger.Println(err)
-		}
-	}
-
 	// Wait for the http server to finish.
 	<-cs.quitChan
 	cs.logger.Println("Done with http server")
@@ -205,22 +185,6 @@ func createCache(logger *log.Logger) ybc.Cacher {
 	}
 	logger.Println("Data files have been opened")
 	return cache
-}
-
-func (cs *cacheServer) serveHttps(addr string) (*fasthttp.Server, net.Listener) {
-	if addr == "" {
-		return nil, nil
-	}
-	cert, err := tls.LoadX509KeyPair(*httpsCertFile, *httpsKeyFile)
-	if err != nil {
-		cs.logger.Fatalf("Cannot load certificate: [%s]", err)
-	}
-	c := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}
-	ln := tls.NewListener(cs.listen(addr), c)
-	cs.logger.Printf("Listening https on [%s]", addr)
-	return cs.serve(ln), ln
 }
 
 func (cs *cacheServer) serveHttp(addr string) (*fasthttp.Server, net.Listener) {

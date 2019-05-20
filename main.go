@@ -26,9 +26,6 @@ var (
 			"This can increase performance only if frequently accessed items don't fit RAM\n"+
 			"and each cache file is located on a distinct physical storage.")
 	cacheSize            = flag.Int("cacheSize", 100, "The total cache size in Mbytes")
-	httpsCertFile        = flag.String("httpsCertFile", "/etc/ssl/certs/ssl-cert-snakeoil.pem", "Path to HTTPS server certificate. Used only if listenHttpsAddr is set")
-	httpsKeyFile         = flag.String("httpsKeyFile", "/etc/ssl/private/ssl-cert-snakeoil.key", "Path to HTTPS server key. Used only if listenHttpsAddr is set")
-	httpsListenAddr      = flag.String("httpsListenAddr", "", "TCP address to listen to HTTPS requests. Leave empty if you don't need https")
 	listenAddr           = flag.String("listenAddr", ":8098", "TCP address to listen to HTTP requests. Leave empty if you don't need http")
 	maxIdleUpstreamConns = flag.Int("maxIdleUpstreamConns", 50, "The maximum idle connections to upstream host")
 	maxItemsCount        = flag.Int("maxItemsCount", 100*1000, "The maximum number of items in the cache")

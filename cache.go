@@ -9,31 +9,43 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/micro/mdns"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/ybc/bindings/go/ybc"
 )
 
 type cacheServer struct {
-	cache             ybc.Cacher
-	stats             Stats
-	upstreamClient    *fasthttp.Client
-	logger            *log.Logger
-	upstreamHostBytes []byte
-	keyPool           sync.Pool
-	httpSrv, httpsSrv *fasthttp.Server
+	originMapMu             sync.RWMutex
+	originMap               map[string]string
+	cache                   ybc.Cacher
+	stats                   Stats
+	upstreamClient          *fasthttp.Client
+	logger                  *log.Logger
+	upstreamHostBytes       []byte
+	keyPool                 sync.Pool
+	entriesChan             chan *mdns.ServiceEntry
+	queryInterval           time.Duration
+	httpSrv, httpsSrv       *fasthttp.Server
+	queryDoneChan, quitChan chan struct{}
 }
 
 // NewCacheServer returns a new instance of a cache server.
-func NewCacheServer(l *log.Logger) *cacheServer {
+func NewCacheServer(l *log.Logger, queryInt time.Duration) *cacheServer {
 	c := &cacheServer{
 		cache:          createCache(l),
 		upstreamClient: &fasthttp.Client{},
+		entriesChan:    make(chan *mdns.ServiceEntry),
+		queryInterval:  queryInt,
 		logger:         l,
+		originMap:      make(map[string]string),
+		queryDoneChan:  make(chan struct{}),
+		quitChan:       make(chan struct{}),
 	}
 	return c
 }
@@ -41,7 +53,19 @@ func NewCacheServer(l *log.Logger) *cacheServer {
 // Start starts the cache server.
 func (cs *cacheServer) Start() {
 	httpsSrv, httpsLn := cs.serveHttps(*httpsListenAddr)
-	httpSrv, httpLn := cs.serveHttp(*listenAddr)
+	var ln net.Listener
+	cs.httpSrv, ln = cs.serveHttp(*listenAddr)
+	go func() {
+		if cs.httpSrv == nil {
+			return
+		}
+		err := cs.httpSrv.Serve(ln)
+		if err != nil {
+			cs.logger.Fatal(err)
+		}
+		// sending the quit signal.
+		cs.quitChan <- struct{}{}
+	}()
 
 	go func() {
 		if httpsSrv == nil {
@@ -54,16 +78,60 @@ func (cs *cacheServer) Start() {
 		cs.httpsSrv = httpsSrv
 	}()
 
-	go func() {
-		if httpSrv == nil {
+	go cs.readServiceEntries()
+
+	cs.lookupServices()
+
+	// Start the query loop
+	go cs.queryLoop()
+}
+
+func (cs *cacheServer) lookupServices() {
+	// Start the lookup
+	err := mdns.Lookup("stream_publisher._tcp", cs.entriesChan)
+	if err != nil {
+		cs.logger.Fatal(err)
+	}
+}
+
+func (cs *cacheServer) readServiceEntries() {
+	for {
+		select {
+		case entry := <-cs.entriesChan:
+			// Channel is closed, so exit
+			if entry == nil {
+				return
+			}
+			streamMetadata := strings.Split(entry.Info, "_")
+			if len(streamMetadata) < 2 {
+				cs.logger.Println("malformed stream publisher info: ", entry.Info)
+				continue
+			}
+			prefix := streamMetadata[1]
+			originAddr := entry.AddrV4.String() + ":" + strconv.Itoa(entry.Port)
+			cs.originMapMu.Lock()
+			cs.originMap[prefix] = originAddr
+			cs.originMapMu.Unlock()
+			cs.logger.Println("prefix- ", prefix)
+			cs.logger.Println("originAddr- ", originAddr)
+		}
+	}
+}
+
+func (cs *cacheServer) queryLoop() {
+	ticker := time.NewTicker(cs.queryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-cs.queryDoneChan:
+			cs.logger.Println("Exiting from query loop")
+			cs.quitChan <- struct{}{}
 			return
+		case <-ticker.C:
+			cs.logger.Println("Refreshing service list")
+			cs.lookupServices()
 		}
-		err := httpSrv.Serve(httpLn)
-		if err != nil {
-			cs.logger.Fatal(err)
-		}
-		cs.httpSrv = httpSrv
-	}()
+	}
 }
 
 // Close gracefully shuts down the cache server.
@@ -73,11 +141,9 @@ func (cs *cacheServer) Close() {
 		cs.logger.Println(err)
 	}
 
-	if cs.httpSrv != nil {
-		err := cs.httpSrv.Shutdown()
-		if err != nil {
-			cs.logger.Println(err)
-		}
+	err = cs.httpSrv.Shutdown()
+	if err != nil {
+		cs.logger.Println(err)
 	}
 
 	if cs.httpsSrv != nil {
@@ -86,6 +152,18 @@ func (cs *cacheServer) Close() {
 			cs.logger.Println(err)
 		}
 	}
+
+	// Wait for the http server to finish.
+	<-cs.quitChan
+	cs.logger.Println("Done with http server")
+
+	// Exiting the query loop.
+	cs.queryDoneChan <- struct{}{}
+	<-cs.quitChan
+
+	// Close the entries chan.
+	cs.logger.Println("Closing the entries chan")
+	close(cs.entriesChan)
 }
 
 func createCache(logger *log.Logger) ybc.Cacher {
@@ -187,10 +265,20 @@ func (cs *cacheServer) requestHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// Get the origin
+	items := strings.Split(path, "_")
+	if len(items) < 2 {
+		cs.logger.Println("malformed url: ", path)
+		ctx.Error("bad url", fasthttp.StatusInternalServerError)
+		return
+	}
+	originPrefix := strings.TrimPrefix(items[0], "/")
+	cs.logger.Println("originPrefix- ", originPrefix)
 	// Avoid caching of m3u8 playlist file
 	if strings.HasSuffix(path, ".m3u8") {
-		originAddr := ctx.QueryArgs().Peek("origin")
-		upstreamURL := *upstreamProtocol + "://" + string(originAddr) + path
+		cs.originMapMu.Lock()
+		upstreamURL := *upstreamProtocol + "://" + cs.originMap[originPrefix] + path
+		cs.originMapMu.Unlock()
 		var req fasthttp.Request
 		req.SetRequestURI(upstreamURL)
 
@@ -232,7 +320,9 @@ func (cs *cacheServer) requestHandler(ctx *fasthttp.RequestCtx) {
 		v = make([]byte, 128)
 	}
 	key := v.([]byte)
-	key = append(key[:0], ctx.QueryArgs().Peek("origin")...)
+	cs.originMapMu.Lock()
+	key = append(key[:0], []byte(cs.originMap[originPrefix])...)
+	cs.originMapMu.Unlock()
 	key = append(key, ctx.Path()...)
 	item, err := cs.cache.GetDeItem(key, time.Second)
 	if err != nil {
